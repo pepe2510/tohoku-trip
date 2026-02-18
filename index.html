@@ -1,0 +1,1026 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>仙台・山形 冰雪之旅</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/Sortable/1.15.2/Sortable.min.js"></script>
+
+    <!-- Firebase SDK -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+        import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+        const firebaseConfig = {
+            apiKey: "AIzaSyCSJVNzZ1YtP_jA2rt2v6AvNITsqq5siP0",
+            authDomain: "tohoku-trip.firebaseapp.com",
+            databaseURL: "https://tohoku-trip-default-rtdb.asia-southeast1.firebasedatabase.app",
+            projectId: "tohoku-trip",
+            storageBucket: "tohoku-trip.firebasestorage.app",
+            messagingSenderId: "94149530181",
+            appId: "1:94149530181:web:175b1f9b9530b45c55892c"
+        };
+
+        const app = initializeApp(firebaseConfig);
+        const db = getDatabase(app);
+        const tripRef = ref(db, 'trip_v3');
+
+        window._fb = { set, onValue, ref: tripRef };
+        window._fb.ready = true;
+        window.dispatchEvent(new CustomEvent('fb-ready'));
+    </script>
+
+    <script>
+        document.addEventListener('alpine:init', () => {
+            Alpine.data('tripData', () => ({
+                activeDay: 'day2',
+                sortableInstance: null,
+                newChecklistItem: '',
+                newChecklistType: 'item',
+                syncStatus: 'loading',
+                _dataVersion: 3,
+                jpyRate: null,
+                jpyRateDate: '',
+
+                init() {
+                    window._trip = { saveTimer: null, isSyncing: false };
+                    this._fetchJpyRate();
+                    this._loadData();
+                    this.$watch('activeDay', () => {
+                        this.newChecklistItem = '';
+                        this.newChecklistType = 'item';
+                        this.$nextTick(() => this.initSortable());
+                    });
+                },
+
+                // ── 資料載入：Firebase 為唯一真實來源 ──
+                _loadData() {
+                    const LOCAL_KEY = 'tohoku_trip_v3';
+                    window._trip.watcherStarted = false;
+
+                    const startWatcher = () => {
+                        if (window._trip.watcherStarted) return;
+                        window._trip.watcherStarted = true;
+                        this._startWatcher(LOCAL_KEY);
+                        window.addEventListener('beforeunload', () => this._flushSave(LOCAL_KEY));
+                        document.addEventListener('visibilitychange', () => {
+                            if (document.visibilityState === 'hidden') this._flushSave(LOCAL_KEY);
+                        });
+                    };
+
+                    const setupFirebase = () => {
+                        // onValue fires immediately with current value, then on every change
+                        window._fb.onValue(window._fb.ref, (snapshot) => {
+                            // If we're in the middle of saving, skip echo
+                            if (window._trip.isSyncing) return;
+
+                            const raw = snapshot.val();
+
+                            if (raw && raw.ts && raw.data) {
+                                // Firebase has data — always use it as source of truth
+                                const arr = Array.isArray(raw.data)
+                                    ? raw.data
+                                    : Object.keys(raw.data)
+                                        .filter(k => !isNaN(k))
+                                        .sort((a, b) => a - b)
+                                        .map(k => raw.data[k]);
+
+                                if (arr.length > 0) {
+                                    window._trip.isSyncing = true;
+                                    this.itinerary = arr;
+                                    this._normalizeItinerary();
+                                    localStorage.setItem(LOCAL_KEY, JSON.stringify({ ts: raw.ts, data: arr }));
+                                    this.$nextTick(() => {
+                                        this.initSortable();
+                                        setTimeout(() => { window._trip.isSyncing = false; }, 200);
+                                    });
+                                }
+                            } else {
+                                // Firebase empty — push HTML default data up
+                                const ts = Date.now();
+                                const data = JSON.parse(JSON.stringify(this.itinerary));
+                                window._trip.isSyncing = true;
+                                window._fb.set(window._fb.ref, { ts, data })
+                                    .then(() => { setTimeout(() => { window._trip.isSyncing = false; }, 200); })
+                                    .catch(() => { window._trip.isSyncing = false; });
+                            }
+
+                            this.syncStatus = 'synced';
+                            startWatcher();
+
+                        }, (err) => {
+                            console.warn('[Firebase] error:', err);
+                            this.syncStatus = 'offline';
+                            // Fall back to localStorage
+                            const local = localStorage.getItem(LOCAL_KEY);
+                            if (local) {
+                                try {
+                                    const parsed = JSON.parse(local);
+                                    if (parsed.data) {
+                                        this.itinerary = parsed.data;
+                                        this._normalizeItinerary();
+                                        this.$nextTick(() => this.initSortable());
+                                    }
+                                } catch(e) {}
+                            }
+                            startWatcher();
+                        });
+                    };
+
+                    // Show cached data instantly while Firebase loads
+                    const local = localStorage.getItem(LOCAL_KEY);
+                    if (local) {
+                        try {
+                            const parsed = JSON.parse(local);
+                            if (parsed.data) {
+                                this.itinerary = parsed.data;
+                                this._normalizeItinerary();
+                                this.$nextTick(() => this.initSortable());
+                            }
+                        } catch(e) {}
+                    }
+                    this.syncStatus = 'loading';
+
+                    if (window._fb && window._fb.ready) {
+                        setupFirebase();
+                    } else {
+                        window.addEventListener('fb-ready', setupFirebase, { once: true });
+                        setTimeout(() => {
+                            if (!window._trip.watcherStarted) {
+                                this.syncStatus = 'offline';
+                                startWatcher();
+                            }
+                        }, 5000);
+                    }
+                },
+
+                _startWatcher(localKey) {
+                    this.$watch('itinerary', () => {
+                        this.syncStatus = 'saving';
+                        clearTimeout(window._trip.saveTimer);
+                        window._trip.saveTimer = setTimeout(() => {
+                            window._trip.saveTimer = null;
+                            this._save(localKey);
+                        }, 600);
+                    }, { deep: true });
+                },
+
+                _flushSave(localKey) {
+                    if (window._trip.saveTimer) {
+                        clearTimeout(window._trip.saveTimer);
+                        window._trip.saveTimer = null;
+                        this._save(localKey);
+                    }
+                },
+
+                _save(localKey) {
+                    const ts = Date.now();
+                    const data = JSON.parse(JSON.stringify(this.itinerary));
+                    // Save to localStorage immediately
+                    localStorage.setItem(localKey, JSON.stringify({ ts, data }));
+                    console.log('[Storage] saved to localStorage ts:', ts);
+                    // Push to Firebase
+                    if (window._fb && window._fb.ready && this.syncStatus !== 'offline') {
+                        window._trip.isSyncing = true;
+                        window._fb.set(window._fb.ref, { ts, data })
+                            .then(() => {
+                                this.syncStatus = 'synced';
+                                console.log('[Firebase] saved ts:', ts);
+                                setTimeout(() => { window._trip.isSyncing = false; }, 500);
+                            })
+                            .catch(err => {
+                                window._trip.isSyncing = false;
+                                console.warn('[Firebase] save failed', err);
+                                this.syncStatus = 'offline';
+                            });
+                    } else {
+                        this.syncStatus = 'synced';
+                    }
+                },
+
+                _normalizeItinerary() {
+                    this.itinerary.forEach(day => {
+                        if (!day.events) day.events = [];
+                        if (!day.checklist) day.checklist = [];
+                        if (!day.expenses) day.expenses = [];
+                        day.events.forEach(event => {
+                            if (!event.id) event.id = Math.random().toString(36).substr(2, 9);
+                            if (!event.note) event.note = '';
+                            if (!event.address) event.address = '';
+                            if (!event.hours) event.hours = '';
+                            if (!event.mapUrl) event.mapUrl = '';
+                            if (!event.links) event.links = [];
+                            if (event.expanded === undefined) event.expanded = false;
+                        });
+                    });
+                },
+
+                async _fetchJpyRate() {
+                    try {
+                        // 台灣銀行牌告匯率 CSV (CORS-friendly endpoint)
+                        const res = await fetch('https://rate.bot.com.tw/xchg/flcsv/0/day');
+                        const text = await res.text();
+                        // CSV format: 幣別,現金買入,現金賣出,即期買入,即期賣出,...
+                        const lines = text.split('\n');
+                        for (const line of lines) {
+                            if (line.startsWith('日本')) {
+                                const cols = line.split(',');
+                                // cols[3] = 即期買入, cols[4] = 即期賣出
+                                const sell = parseFloat(cols[4]);
+                                if (!isNaN(sell)) {
+                                    this.jpyRate = sell;
+                                    this.jpyRateDate = new Date().toLocaleDateString('zh-TW');
+                                }
+                                break;
+                            }
+                        }
+                    } catch (e) {
+                        // CORS blocked — fallback: try via allorigins proxy
+                        try {
+                            const proxy = 'https://api.allorigins.win/raw?url=' + encodeURIComponent('https://rate.bot.com.tw/xchg/flcsv/0/day');
+                            const res2 = await fetch(proxy);
+                            const text2 = await res2.text();
+                            const lines2 = text2.split('\n');
+                            for (const line of lines2) {
+                                if (line.startsWith('日本')) {
+                                    const cols = line.split(',');
+                                    const sell = parseFloat(cols[4]);
+                                    if (!isNaN(sell)) {
+                                        this.jpyRate = sell;
+                                        this.jpyRateDate = new Date().toLocaleDateString('zh-TW');
+                                    }
+                                    break;
+                                }
+                            }
+                        } catch (e2) {
+                            console.warn('匯率取得失敗，使用預設值');
+                            this.jpyRate = 0.2195; // 備用匯率
+                            this.jpyRateDate = '預設值';
+                        }
+                    }
+                },
+
+                toTwd(jpy) {
+                    if (!this.jpyRate || !jpy) return null;
+                    return Math.round(jpy * this.jpyRate);
+                },
+
+                get syncLabel() {
+                    return {
+                        loading: '⏳ 載入中…',
+                        saving:  '☁️ 儲存中…',
+                        synced:  '✅ 已同步',
+                        offline: '⚠️ 離線模式'
+                    }[this.syncStatus] || '';
+                },
+
+                get syncColor() {
+                    return {
+                        loading: 'text-slate-400',
+                        saving:  'text-blue-500',
+                        synced:  'text-emerald-600',
+                        offline: 'text-amber-500'
+                    }[this.syncStatus] || '';
+                },
+
+                initSortable() {
+                    const el = document.getElementById('sortable-events');
+                    if (!el) return;
+                    if (this.sortableInstance) this.sortableInstance.destroy();
+                    this.sortableInstance = Sortable.create(el, {
+                        animation: 150,
+                        handle: '.drag-handle',
+                        ghostClass: 'opacity-30',
+                        onEnd: (evt) => {
+                            const list = this.currentDayData.events;
+                            const item = list.splice(evt.oldIndex, 1)[0];
+                            list.splice(evt.newIndex, 0, item);
+                        }
+                    });
+                },
+
+                get currentDayData() {
+                    return this.itinerary.find(d => d.id === this.activeDay);
+                },
+
+                // 解析費用：NT開頭視為台幣，其他視為JPY轉台幣
+                parseCost(val) {
+                    const s = String(val || '').trim();
+                    if (/^NT\s*/i.test(s)) {
+                        return { jpy: 0, twd: parseFloat(s.replace(/^NT\s*/i, '')) || 0 };
+                    }
+                    const jpy = parseFloat(s) || 0;
+                    return { jpy, twd: Math.round(jpy * 0.21) };
+                },
+
+                _sumItems(items) {
+                    return (items || []).reduce((acc, i) => {
+                        const p = this.parseCost(i.cost);
+                        return { jpy: acc.jpy + p.jpy, twd: acc.twd + p.twd };
+                    }, { jpy: 0, twd: 0 });
+                },
+
+                get currentDayTotal() {
+                    const ev = this._sumItems(this.currentDayData.events);
+                    const ex = this._sumItems(this.currentDayData.expenses);
+                    return { jpy: ev.jpy + ex.jpy, twd: ev.twd + ex.twd };
+                },
+
+                get totalBudget() {
+                    return this.itinerary.reduce((acc, day) => {
+                        const ev = this._sumItems(day.events);
+                        const ex = this._sumItems(day.expenses);
+                        return { jpy: acc.jpy + ev.jpy + ex.jpy, twd: acc.twd + ev.twd + ex.twd };
+                    }, { jpy: 0, twd: 0 });
+                },
+
+                toggleEvent(event) {
+                    event.expanded = !event.expanded;
+                },
+
+                addEvent() {
+                    const newEvent = {
+                        id: Math.random().toString(36).substr(2, 9),
+                        time: '00:00', location: '新行程',
+                        detail: '請輸入行程細節',
+                        note: '', address: '', hours: '', mapUrl: '',
+                        cost: 0, links: [], expanded: true
+                    };
+                    this.currentDayData.events.push(newEvent);
+                    this.$nextTick(() => this.initSortable());
+                },
+
+                addExpense() {
+                    if (!this.currentDayData.expenses) this.currentDayData.expenses = [];
+                    this.currentDayData.expenses.push({
+                        id: Math.random().toString(36).substr(2, 9),
+                        location: '新支出項目', cost: 0
+                    });
+                },
+
+                removeEventById(id) {
+                    if(confirm('確定要刪除此行程嗎？')) {
+                        const index = this.currentDayData.events.findIndex(e => e.id === id);
+                        if (index !== -1) {
+                            this.currentDayData.events.splice(index, 1);
+                            this.$nextTick(() => this.initSortable());
+                        }
+                    }
+                },
+
+                removeExpenseById(id) {
+                    if(confirm('確定要刪除此支出嗎？')) {
+                        const idx = (this.currentDayData.expenses || []).findIndex(e => e.id === id);
+                        if (idx !== -1) this.currentDayData.expenses.splice(idx, 1);
+                    }
+                },
+
+                addChecklistItem() {
+                    const val = this.newChecklistItem.trim();
+                    if (val === '') return;
+                    let item;
+                    if (this.newChecklistType === 'category') {
+                        item = '📌 ' + val;
+                    } else {
+                        item = val;
+                    }
+                    this.currentDayData.checklist.push({ item, done: false });
+                    this.newChecklistItem = '';
+                    this.$nextTick(() => {
+                        const input = document.getElementById('checklist-input-' + this.activeDay);
+                        if (input) input.focus();
+                    });
+                },
+
+                addItemAfterCategory(categoryIndex) {
+                    const val = prompt('輸入新項目名稱：');
+                    if (!val || val.trim() === '') return;
+                    // Insert after the category and any existing items under it
+                    const list = this.currentDayData.checklist;
+                    const catEmojis = ['📋','📱','💊','🧥','🧣','🧤','🎽','🏂','📌'];
+                    let insertAt = categoryIndex + 1;
+                    // Skip past existing items that belong to this category
+                    while (insertAt < list.length && !catEmojis.some(e => list[insertAt].item.startsWith(e))) {
+                        insertAt++;
+                    }
+                    list.splice(insertAt, 0, { item: val.trim(), done: false });
+                },
+                removeChecklistItem(index) {
+                    this.currentDayData.checklist.splice(index, 1);
+                },
+
+                itinerary: [
+                    {
+                        id: 'pre-trip', date: '行前', title: '準備清單',
+                        tip: '出發前務必逐項確認，尤其是護照有效期限與網路設定。',
+                        checklist: [
+                            { item: '📋 證件與票務', done: false },
+                            { item: '護照 (效期6個月以上)', done: false },
+                            { item: '機票電子檔/截圖存手機', done: false },
+                            { item: 'Visit Japan Web 填寫完成 QR Code', done: false },
+                            { item: '海外旅遊保險 (旅平險/不便險)', done: false },
+                            { item: '📱 通訊與金錢', done: false },
+                            { item: '網卡/eSIM 設定確認', done: false },
+                            { item: '日幣現金換匯', done: false },
+                            { item: '信用卡 (確認開啟海外交易)', done: false },
+                            { item: '行動電源 (需隨身攜帶)', done: false },
+                            { item: '💊 醫療', done: false },
+                            { item: '個人常備藥品', done: false },
+                            { item: '專業護膝 — 右膝 MCL 支撐型 (針對舊傷保溫與加壓)', done: false },
+                            { item: '🧥 底層 (Base Layer)', done: false },
+                            { item: 'UA 發熱衣 — 藍色 x1 (2/20 松島使用)', done: false },
+                            { item: 'MONTBELL Zeoline — 白色 x1 (2/21 使用)', done: false },
+                            { item: 'MONTBELL 羊毛衣 — 粉色 x1 (2/22 烏帽子滑雪使用)', done: false },
+                            { item: 'WORKMAN 羊毛衣 — 黑色/深色 x2 (2/23-24、2/28 使用)', done: false },
+                            { item: '羊毛底層衣 — 綠色 x1 (2/25-27 藏王滑雪專用)', done: false },
+                            { item: '🧣 中層 (Mid Layer)', done: false },
+                            { item: '刷毛 T — 粉色 x1、黃色 x1 (市區與景點日替換)', done: false },
+                            { item: 'Primaloft Active 95g 橘色 x1 (2/22 動態滑雪用，高透氣)', done: false },
+                            { item: 'Primaloft Active 170g 粉色 x1 (2/25-27 藏王低溫用，高保暖)', done: false },
+                            { item: '羽絨背心 — 輕薄型 x1 (保險層，2/23 銀山及 2/28 山寺必備)', done: false },
+                            { item: '🧤 外層 (Outer Layer)', done: false },
+                            { item: 'Timberland 魚尾大衣 — 黑色 A6HB9001 (市區觀光全程使用)', done: false },
+                            { item: 'Protest Anorak PRTKOW — (2/22 烏帽子滑雪用)', done: false },
+                            { item: 'Roxy 雪衣外套 — 專業款 (2/25-27 藏王滑雪用)', done: false },
+                            { item: '🎽 配件 (Accessories)', done: false },
+                            { item: '羊毛襪 — 市區 x3 雙、滑雪 x3 雙 (不清洗，每雙穿2天)', done: false },
+                            { item: '手套 — HEAD x1 (市區)、DAKINE x2 (滑雪，確認防水)', done: false },
+                            { item: '毛帽 x2', done: false },
+                            { item: '安全帽 + 面罩 (藏王山頂風大，面罩必帶)', done: false },
+                            { item: '  Ride Warpig 148cm — 確認固定器螺絲已鎖緊', done: false }
+                        ],
+                        events: [
+                            { time: '去程', location: '虎航 IT254', detail: 'TPE 14:35 - SDJ 18:45', note: '已確認', cost: 15000, links: [], expanded: false },
+                            { time: '回程', location: '虎航 IT255', detail: 'SDJ 19:40 - TPE 23:00', note: '已確認', cost: 0, links: [], expanded: false },
+                            { time: '', location: '保險費用', detail: '旅平險+不便險', note: '', cost: 1200, links: [], expanded: false },
+                            { time: '前48H', location: '線上報到', detail: '航空公司官網預辦登機', note: '選位確認', cost: 0, links: [], expanded: false }
+                        ]
+                    },
+                    {
+                        id: 'day1', date: '2/19', title: '抵達仙台',
+                        tip: '班機抵達時間較晚，建議出關後直接前往飯店，晚餐可選擇車站周邊較晚打烊的店家。',
+                        checklist: [
+                            { item: '確認 IT254 航班報到時間', done: false },
+                            { item: '領取日幣現金與網卡', done: false },
+                            { item: '確認飯店入住預約信', done: false }
+                        ],
+                        events: [
+                            { time: '18:45', location: '仙台機場', detail: '搭乘 IT254 抵達。', note: '入境審查與領取行李', cost: 0, links: [], expanded: false },
+                            { time: '19:10 - 19:37', location: '仙台空港線', detail: '搭乘往仙台方向，抵達仙台站。', note: '若趕不上可搭 19:42 的班次', cost: 660, links: [], expanded: false },
+                            { time: '20:00', location: '相鐵 FRESA INN', detail: '辦理入住 Check-in。', note: '櫃台在2樓', cost: 0, links: [], expanded: false },
+                            { time: '20:30', location: '晚餐', detail: '仙台站 3F 牛舌通 / 善治郎 (若排隊人多改吃車站便當或超商)', note: 'Bic Camera 21:00 打烊可能來不及', cost: 3500, links: [], expanded: false }
+                        ]
+                    },
+                    {
+                        id: 'day2', date: '2/20', title: '松島與採買',
+                        tip: '提早於 11:00 吃午餐可避開遊覽團人潮。',
+                        checklist: [
+                            { item: '確認松島遊覽船班次時間', done: false },
+                            { item: '攜帶環保袋前往 WORKMAN', done: false }
+                        ],
+                        events: [
+                            { time: '08:30', location: '仙台朝市', detail: '早餐推薦：朝市丼、齋藤餃子。', note: '', address: '仙台市青葉區中央 4-3-28', hours: '08:00 - 18:00 (週日公休)', mapUrl: 'https://goo.gl/maps/SendaiAsaichi', cost: 0, links: [], expanded: false },
+                            { time: '09:29 - 10:10', location: 'JR 仙石線', detail: '抵達松島海岸站 (來回車資)。', note: '', cost: 840, links: [], expanded: false },
+                            { time: '10:15 - 11:00', location: '圓通院', detail: '欣賞精緻庭園與結緣觀音。', note: '', address: '宮城縣宮城郡松島町松島町内67', hours: '09:00 - 16:00', mapUrl: 'https://goo.gl/maps/Entsuin', cost: 1200, links: [], expanded: false },
+                            { time: '11:00 - 12:15', location: '松島魚市場 (午餐)', detail: '提早吃午餐，推薦烤牡蠣小屋。', note: '', address: '宮城縣宮城郡松島町松島字普賢堂4-10', hours: '08:00 - 17:00 (食堂 10:00-15:00)', mapUrl: 'https://goo.gl/maps/MatsushimaFishMarket', cost: 2500, links: [], expanded: false },
+                            { time: '12:20 - 13:00', location: '瑞嚴寺', detail: '伊達政宗菩提寺，國寶本堂。', note: '', address: '宮城縣宮城郡松島町松島町内91', hours: '08:30 - 16:00', mapUrl: 'https://goo.gl/maps/Zuiganji', cost: 0, links: [], expanded: false },
+                            { time: '13:10 - 13:40', location: '五大堂', detail: '經典紅橋地標散策。', note: '', address: '宮城縣宮城郡松島町松島町内111', hours: '08:00 - 16:30', mapUrl: 'https://goo.gl/maps/Godaido', cost: 0, links: [], expanded: false },
+                            { time: '14:00 - 14:50', location: '松島灣遊船', detail: '搭船休息，欣賞松島灣美景。', links: [{ title: '遊覽船時刻表與預約', url: 'https://www.matsushima-kankousen.co.jp/' }], note: '', address: '宮城縣宮城郡松島町松島町内98-1', hours: '09:00 - 15:00', mapUrl: 'https://goo.gl/maps/MatsushimaCruise', cost: 1500, expanded: false },
+                            { time: '16:04 - 16:21', location: '前往中野榮站', detail: '搭乘 JR 仙石線。', note: '', cost: 0, links: [], expanded: false },
+                            { time: '16:30 - 18:30', location: 'WORKMAN 仙台中野店', detail: '機能服飾購物。', note: '', address: '仙台市宮城野區中野出花西5-4-35', hours: '07:00 - 20:00', mapUrl: 'https://goo.gl/maps/WorkmanSendaiNakano', cost: 0, links: [], expanded: false },
+                            { time: '19:00', location: '返回仙台', detail: '晚餐與補逛 Bic Camera (昨天沒逛到的話)。', note: '壽司通り (仙台站 3F)', cost: 0, links: [], expanded: false }
+                        ]
+                    },
+                    {
+                        id: 'day3', date: '2/21', title: '神社參拜',
+                        tip: '週末神社參拜者多，建議中午前抵達；務必確認巴士回程時刻。',
+                        checklist: [
+                            { item: '整理行李準備換宿', done: false },
+                            { item: '查閱岩沼站往返神社巴士時刻', done: false }
+                        ],
+                        events: [
+                            { time: '08:30', location: '仙台朝市', detail: '早餐。', note: '', address: '仙台市青葉區中央 4-3-28', hours: '08:00 - 18:00 (週日公休)', mapUrl: 'https://goo.gl/maps/SendaiAsaichi', cost: 0, links: [], expanded: false },
+                            { time: '上午', location: '東橫INN 仙台站西口中央', detail: '辦理退房，行李移至新飯店。', note: '', cost: 0, links: [], expanded: false },
+                            { time: '下午', location: 'JR 東北本線', detail: '仙台站往返岩沼站車資。', note: '', cost: 680, links: [], expanded: false },
+                            { time: '下午', location: '金蛇水神社', detail: '轉乘計程車或市營巴士參拜。祈求財運與事業。', links: [{ title: '金蛇水神社官網', url: 'https://kanahebi.cdx.jp/' }], note: '', address: '宮城縣岩沼市三色吉字水神7', hours: '08:00 - 16:00 (參拜)', mapUrl: 'https://goo.gl/maps/Kanahebisui', cost: 1500, expanded: false },
+                            { time: '參拜', location: '御守與賽錢', detail: '神社參拜費用。', note: '', cost: 1000, links: [], expanded: false }
+                        ]
+                    },
+                    {
+                        id: 'day4', date: '2/22', title: '烏帽子滑雪',
+                        tip: '託運單務必備註「2/24 Check-in，藏王三五郎小屋收」。',
+                        checklist: [
+                            { item: '領取租車與確認導航', done: false },
+                            { item: '確認 Ride Warpig 148cm 雪板已裝袋', done: false },
+                            { item: '填寫黑貓宅急便託運單', done: false }
+                        ],
+                        events: [
+                            { time: '07:30', location: '仙台租車', detail: '租車與油資分攤。', note: '', cost: 8000, links: [], expanded: false },
+                            { time: '09:00 - 15:30', location: '烏帽子滑雪場', detail: '雪票與活動費用。', links: [{ title: '烏帽子滑雪場官網', url: 'https://www.eboshi.co.jp/' }], note: '', cost: 5500, expanded: false },
+                            { time: '17:00', location: '市區還車', detail: '返回市區辦理還車。', note: '', cost: 0, links: [], expanded: false },
+                            { time: '物流', location: '黑貓/佐川急便', detail: '寄送雪板至藏王。', note: '寄件時需出示護照', cost: 2500, links: [], expanded: false }
+                        ]
+                    },
+                    {
+                        id: 'day5', date: '2/23', title: '銀山溫泉',
+                        tip: '新幹線車次較少，請務必準時。Tsubasa 133 為全車指定席，建議提早劃位。',
+                        checklist: [
+                            { item: '確認新幹線 Tsubasa 177 車票', done: false },
+                            { item: '準備換洗衣物隨身包', done: false }
+                        ],
+                        events: [
+                            { time: '10:00 - 11:20', location: 'JR 仙山線', detail: '仙台 -> 山形站。', note: '快速列車', cost: 1170, links: [], expanded: false },
+                            { time: '11:30 - 12:15', location: '山形站內 (午餐)', detail: '採買午餐或輕食。', note: '', cost: 1200, links: [], expanded: false },
+                            { time: '12:32 - 13:01', location: '新幹線 Tsubasa 177', detail: '山形(12:32) - 大石田(13:01)', note: '座位: 13車 4B', cost: 1450, links: [], expanded: false },
+                            { time: '13:40', location: '銀山溫泉 瀧見舘', detail: '搭乘接駁車前往 (通常配合新幹線時間)。', links: [{ title: '瀧見舘預約確認', url: 'https://www.takimikan.jp/' }], note: '', cost: 0, expanded: false }
+                        ]
+                    },
+                    {
+                        id: 'day6', date: '2/24', title: '轉往藏王',
+                        tip: '注意三五郎小屋的雪場接駁時間，避免錯過末班纜車。',
+                        checklist: [
+                            { item: '確認山交巴士時刻表', done: false },
+                            { item: '與三五郎小屋確認雪地接駁', done: false },
+                            { item: '確認宅急便雪板已抵達', done: false }
+                        ],
+                        events: [
+                            { time: '10:30', location: '大石田站', detail: '搭乘旅館接駁車前往車站。', note: '', cost: 0, links: [], expanded: false },
+                            { time: '11:27 - 12:03', location: '新幹線 Tsubasa 140', detail: '大石田(11:27) - 山形(12:03)', note: '座位: 13車 3C', cost: 1450, links: [], expanded: false },
+                            { time: '12:20 - 12:57', location: '山交巴士 (山形-藏王)', detail: '山形站東口 1 號乘車處。', links: [{ title: '山交巴士時刻表', url: 'https://www.yamakobus.jp/' }], note: '12:20 發車，免預約', cost: 1000, expanded: false },
+                            { time: '13:30', location: '藏王纜車單程', detail: '前往三五郎小屋。', note: '', cost: 1800, links: [], expanded: false },
+                            { time: '14:30', location: '藏王 三五郎小屋', detail: '辦理 Check-in。', links: [{ title: '三五郎小屋官網', url: 'https://www.sangoro.co.jp/' }], note: '', cost: 0, expanded: false }
+                        ]
+                    },
+                    {
+                        id: 'day7', date: '2/25-27', title: '藏王滑雪',
+                        tip: '連三天享受藏王粉雪與樹冰美景。',
+                        checklist: [
+                            { item: '檢查雪具與防寒裝備', done: false },
+                            { item: '購買藏王多日雪票', done: false },
+                            { item: '退房後行李送至山形大和飯店', done: false }
+                        ],
+                        events: [
+                            { time: '全天', location: '藏王三日雪票', detail: '滑雪行程票卷費用。', links: [{ title: '藏王雪場地圖與票價', url: 'https://www.zao-ski.or.jp/' }], note: '', cost: 18000, expanded: false },
+                            { time: '全天', location: '雪場午餐', detail: '三天午餐費用預估。', note: '', cost: 4500, links: [], expanded: false },
+                            { time: '2/27 傍晚', location: '山交巴士 (藏王-山形)', detail: '離開藏王，返回山形站。', note: '每小時一班 (:20或:40)', cost: 1000, links: [], expanded: false },
+                            { time: '住宿', location: '山形大和飯店', detail: '辦理入住。', note: '', cost: 0, links: [], expanded: false }
+                        ]
+                    },
+                    {
+                        id: 'day8', date: '2/28', title: '山寺參訪',
+                        tip: '冬季石階濕滑，登山務必著冰爪並注意步伐。',
+                        checklist: [
+                            { item: '確認冰爪已放入隨身背包', done: false },
+                            { item: '穿著防滑防水鞋', done: false }
+                        ],
+                        events: [
+                            { time: '09:00 - 09:20', location: 'JR 仙山線', detail: '山形-山寺-仙台 全程車資。', note: '', cost: 1500, links: [], expanded: false },
+                            { time: '09:30 - 12:00', location: '山寺 (寶珠山 立石寺)', detail: '著裝已備好的冰爪進行參拜。', links: [{ title: '山寺觀光協會', url: 'https://www.yamaderakankou.com/' }], note: '', address: '山形縣山形市山寺4456-1', hours: '08:00 - 16:00', mapUrl: 'https://goo.gl/maps/Yamadera', cost: 300, expanded: false },
+                            { time: '中午', location: '午餐', detail: '當地午餐。', note: '', cost: 1500, links: [], expanded: false },
+                            { time: '下午', location: '相鐵 FRESA INN', detail: '返回仙台住宿。', note: '', cost: 0, links: [], expanded: false }
+                        ]
+                    },
+                    {
+                        id: 'day9', date: '3/1', title: '賦歸',
+                        tip: 'IT255 19:40 起飛，建議 17:40 前抵達機場。',
+                        checklist: [
+                            { item: '確認 IT255 航班報到時間', done: false },
+                            { item: '確認行李重量不超標', done: false },
+                            { item: '購買保冷袋裝喜久福大福', done: false }
+                        ],
+                        events: [
+                            { time: '10:00', location: '伴手禮採買', detail: 'S-PAL 仙台 (茅乃舍等)。', links: [{ title: 'S-PAL 樓層指南', url: 'https://www.s-pal.jp/sendai/' }], note: '推薦購買：萩之月', cost: 10000, expanded: false },
+                            { time: '12:00', location: '午餐：米澤牛黃木', detail: 'S-PAL 店內享用午餐。', note: '', cost: 4000, links: [], expanded: false },
+                            { time: '17:00', location: '仙台空港線', detail: '前往機場車資。', note: '預計 17:25 抵達機場', cost: 660, links: [], expanded: false },
+                            { time: '19:40', location: '離境 IT255', detail: 'SDJ 19:40 - TPE 23:00', note: '返抵桃園機場', cost: 0, links: [], expanded: false }
+                        ]
+                    }
+                ]
+            }));
+        });
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/alpinejs@3.13.3/dist/cdn.min.js"></script>
+    <style>
+        ::-webkit-scrollbar { width: 0px; background: transparent; }
+        .glass-card {
+            background: rgba(255, 255, 255, 0.75);
+            backdrop-filter: blur(12px);
+            -webkit-backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.6);
+        }
+        [x-cloak] { display: none !important; }
+        .checkbox-custom { accent-color: #2563eb; width: 1.25rem; height: 1.25rem; cursor: pointer; }
+        .input-clean {
+            background: transparent;
+            border: 1px solid transparent;
+            border-radius: 4px;
+            transition: all 0.2s;
+        }
+        .input-clean:hover { background: rgba(255,255,255,0.5); border-color: #cbd5e1; }
+        .input-clean:focus { background: white; border-color: #3b82f6; outline: none; box-shadow: 0 0 0 2px rgba(59,130,246,0.2); }
+        .hide-scrollbar::-webkit-scrollbar { display: none; }
+        .hide-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+        /* Collapsible detail panel */
+        .detail-panel {
+            display: grid;
+            grid-template-rows: 0fr;
+            transition: grid-template-rows 0.3s ease;
+        }
+        .detail-panel.open {
+            grid-template-rows: 1fr;
+        }
+        .detail-panel > div { overflow: hidden; }
+
+        /* Drag handle */
+        .drag-handle { cursor: grab; }
+        .drag-handle:active { cursor: grabbing; }
+
+        /* Chevron rotation */
+        .chevron { transition: transform 0.3s ease; }
+        .chevron.rotated { transform: rotate(180deg); }
+
+        /* Row hover */
+        .event-row:hover { background: rgba(241, 245, 249, 0.8); }
+        .event-row { transition: background 0.15s ease; }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-800 font-sans antialiased selection:bg-blue-200" x-data="tripData()">
+
+    <!-- Header -->
+    <header class="relative h-64 flex items-center justify-center overflow-hidden">
+        <img src="https://images.unsplash.com/photo-1480796927426-f609979314bd?q=80&w=2000" alt="Japan Winter" class="absolute inset-0 w-full h-full object-cover opacity-90">
+        <div class="absolute inset-0 bg-gradient-to-b from-black/50 to-slate-50/90"></div>
+        <div class="relative z-10 text-center px-4">
+            <h1 class="text-4xl md:text-5xl font-extrabold text-white tracking-widest drop-shadow-md mb-2">TOHOKU WINTER</h1>
+            <p class="text-lg md:text-xl text-slate-100 font-medium tracking-wide drop-shadow">仙台・山形・藏王 滑雪紀行</p>
+            <p class="text-sm text-slate-200 mt-2 font-mono">
+                2026.02.19 - 03.01 |
+                ¥<span x-text="totalBudget.jpy.toLocaleString()"></span>
+                <span class="text-slate-300 mx-1">≈</span>
+                NT$<span x-text="totalBudget.twd.toLocaleString()"></span>
+            </p>
+            <p class="mt-2 text-xs font-semibold tracking-wide" :class="syncColor" x-text="syncLabel"></p>
+        </div>
+    </header>
+
+    <!-- Nav -->
+    <nav class="sticky top-0 z-40 glass-card border-b border-slate-200 shadow-sm">
+        <div class="flex overflow-x-auto px-4 py-3 gap-3 max-w-4xl mx-auto scroll-smooth snap-x hide-scrollbar">
+            <template x-for="day in itinerary" :key="day.id">
+                <button 
+                    @click="activeDay = day.id" 
+                    :class="activeDay === day.id ? 'bg-blue-600 text-white shadow-md scale-105' : 'bg-white text-slate-600 hover:bg-slate-50 border border-slate-100'"
+                    class="snap-start shrink-0 flex flex-col items-center justify-center w-14 h-16 rounded-xl transition-all duration-300 relative overflow-hidden mx-1 first:ml-0 last:mr-0">
+                    <div :class="activeDay === day.id ? 'bg-blue-400' : 'bg-slate-200'" class="absolute top-0 w-full h-1.5 transition-colors"></div>
+                    <template x-if="day.id === 'pre-trip'">
+                        <div class="flex flex-col items-center mt-1">
+                            <span class="text-[10px] font-bold opacity-80 uppercase tracking-wide">PRE</span>
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+                            </svg>
+                        </div>
+                    </template>
+                    <template x-if="day.id !== 'pre-trip'">
+                        <div class="flex flex-col items-center leading-none mt-1">
+                            <span class="text-[10px] uppercase font-bold opacity-70" x-text="day.date.split('/')[0] + '月'"></span>
+                            <span class="text-xl font-black tracking-tighter" x-text="parseInt(day.date.split('/')[1])"></span>
+                        </div>
+                    </template>
+                </button>
+            </template>
+        </div>
+    </nav>
+
+    <!-- Main -->
+    <main class="max-w-3xl mx-auto px-4 py-8 min-h-screen">
+
+        <!-- Day Header -->
+        <div class="mb-6">
+            <h2 class="text-2xl font-bold text-slate-800" x-text="currentDayData.date + ' ' + currentDayData.title"></h2>
+            <template x-if="currentDayData.tip">
+                <div class="mt-3 bg-blue-50 border-l-4 border-blue-500 p-3 rounded-r-lg text-sm text-blue-800 flex items-start gap-2">
+                    <span>💡</span>
+                    <span x-text="currentDayData.tip"></span>
+                </div>
+            </template>
+        </div>
+
+        <!-- Checklist + Budget -->
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
+
+            <!-- Checklist -->
+            <div class="glass-card rounded-xl p-4 shadow-sm border-t-4 border-emerald-500 flex flex-col">
+                <div class="flex justify-between items-center mb-3">
+                    <h3 class="font-bold text-emerald-800 flex items-center gap-2">
+                        ☑️ <span x-text="activeDay === 'pre-trip' ? '確認清單' : '每日確認清單'"></span>
+                    </h3>
+                    <button @mousedown.prevent @click="addChecklistItem()"
+                            class="text-xs bg-emerald-100 text-emerald-700 px-2 py-1 rounded hover:bg-emerald-200 transition-colors font-bold flex items-center gap-1">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" /></svg>
+                        新增
+                    </button>
+                </div>
+                <ul class="space-y-1 flex-grow pr-1">
+                    <template x-for="(task, index) in currentDayData.checklist" :key="index">
+                        <li :class="{
+                                'pt-3 pb-1 border-b border-slate-200': ['📋','📱','💊','🧥','🧣','🧤','🎽','🏂','📌'].some(e => task.item.startsWith(e)),
+                                'pl-6': task.item.startsWith('  '),
+                                'pl-1': !task.item.startsWith('  ') && !['📋','📱','💊','🧥','🧣','🧤','🎽','🏂','📌'].some(e => task.item.startsWith(e))
+                            }"
+                            class="flex items-center gap-2 group">
+
+                            <!-- Category header -->
+                            <template x-if="['📋','📱','💊','🧥','🧣','🧤','🎽','🏂','📌'].some(e => task.item.startsWith(e))">
+                                <span class="text-xs font-bold text-slate-500 uppercase tracking-wider flex-grow" x-text="task.item"></span>
+                            </template>
+                            <!-- + button on category header (pre-trip only) -->
+                            <template x-if="['📋','📱','💊','🧥','🧣','🧤','🎽','🏂','📌'].some(e => task.item.startsWith(e)) && activeDay === 'pre-trip'">
+                                <button @click="addItemAfterCategory(index)"
+                                        class="text-slate-300 hover:text-emerald-500 opacity-0 group-hover:opacity-100 transition-opacity shrink-0 p-1" title="在此類別新增項目">
+                                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z"/></svg>
+                                </button>
+                            </template>
+
+                            <!-- Sub-item -->
+                            <template x-if="task.item.startsWith('  ')">
+                                <span class="text-slate-300 shrink-0 text-xs">└</span>
+                            </template>
+                            <template x-if="task.item.startsWith('  ')">
+                                <input type="checkbox" x-model="task.done" class="checkbox-custom shrink-0">
+                            </template>
+                            <template x-if="task.item.startsWith('  ')">
+                                <span :class="task.done ? 'line-through text-slate-400' : 'text-slate-500'"
+                                      class="text-sm transition-all flex-grow truncate"
+                                      x-text="task.item.trim()"></span>
+                            </template>
+
+                            <!-- Regular item -->
+                            <template x-if="!task.item.startsWith('  ') && !['📋','📱','💊','🧥','🧣','🧤','🎽','🏂','📌'].some(e => task.item.startsWith(e))">
+                                <input type="checkbox" x-model="task.done" class="checkbox-custom shrink-0">
+                            </template>
+                            <template x-if="!task.item.startsWith('  ') && !['📋','📱','💊','🧥','🧣','🧤','🎽','🏂','📌'].some(e => task.item.startsWith(e))">
+                                <span :class="task.done ? 'line-through text-slate-400' : 'text-slate-700'"
+                                      class="text-sm transition-all flex-grow truncate"
+                                      x-text="task.item"></span>
+                            </template>
+
+                            <!-- Delete -->
+                            <button @click="removeChecklistItem(index)"
+                                    class="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity shrink-0 p-1">
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5"><path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"/></svg>
+                            </button>
+                        </li>
+                    </template>
+                </ul>
+                <!-- Add row: show type toggle only on pre-trip -->
+                <div class="mt-3 pt-3 border-t border-emerald-100">
+                    <template x-if="activeDay === 'pre-trip'">
+                        <div class="flex gap-1 mb-2">
+                            <button @mousedown.prevent @click="newChecklistType = 'item'"
+                                    :class="newChecklistType === 'item' ? 'bg-emerald-500 text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'"
+                                    class="text-xs px-2.5 py-1 rounded-full font-semibold transition-colors">
+                                ☑ 項目
+                            </button>
+                            <button @mousedown.prevent @click="newChecklistType = 'category'"
+                                    :class="newChecklistType === 'category' ? 'bg-slate-600 text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'"
+                                    class="text-xs px-2.5 py-1 rounded-full font-semibold transition-colors">
+                                📌 類別
+                            </button>
+                        </div>
+                    </template>
+                    <div class="flex items-center gap-2">
+                        <input :id="'checklist-input-' + activeDay"
+                               type="text"
+                               x-model="newChecklistItem"
+                               @keydown.enter="addChecklistItem()"
+                               :placeholder="newChecklistType === 'category' ? '輸入類別名稱...' : '輸入確認項目...'"
+                               class="flex-grow bg-transparent border border-transparent hover:border-slate-200 focus:border-emerald-400 focus:bg-white rounded px-2 py-1 text-sm focus:outline-none transition-all placeholder-slate-300">
+                        <button @mousedown.prevent @click="addChecklistItem()"
+                                class="text-slate-300 hover:text-emerald-500 transition-colors shrink-0 p-1">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z"/></svg>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Budget -->
+            <div class="glass-card rounded-xl p-4 shadow-sm border-t-4 border-amber-500 flex flex-col">
+                <div class="flex justify-between items-center mb-3">
+                    <h3 class="font-bold text-amber-800 flex items-center gap-2">💰 本日支出 (JPY)</h3>
+                    <button @click="addExpense()" class="text-xs bg-amber-100 text-amber-700 px-2 py-1 rounded hover:bg-amber-200 transition-colors font-bold flex items-center gap-1">
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4"><path d="M10.75 4.75a.75.75 0 00-1.5 0v4.5h-4.5a.75.75 0 000 1.5h4.5v4.5a.75.75 0 001.5 0v-4.5h4.5a.75.75 0 000-1.5h-4.5v-4.5z" /></svg>
+                        新增
+                    </button>
+                </div>
+                <ul class="space-y-0.5 flex-grow overflow-y-auto max-h-64 pr-1">
+                    <!-- Events with cost (now editable + deletable, same layout) -->
+                    <template x-for="event in currentDayData.events.filter(e => String(e.cost||'').trim() && String(e.cost||'').trim() !== '0')" :key="'ev-' + event.id">
+                        <li class="flex items-center gap-2 text-sm border-b border-slate-100 pb-1 group">
+                            <input type="text" x-model="event.location"
+                                   class="bg-transparent hover:bg-white focus:bg-white border border-transparent hover:border-slate-200 focus:border-blue-300 rounded px-1 py-0.5 flex-grow min-w-0 truncate focus:outline-none transition-all text-slate-600 text-sm">
+                            <input type="text" x-model="event.cost"
+                                   class="w-24 shrink-0 bg-transparent hover:bg-white focus:bg-white border border-transparent hover:border-slate-200 focus:border-blue-300 rounded px-1 py-0.5 text-right font-mono focus:outline-none transition-all text-slate-700 text-sm"
+                                   placeholder="0">
+                            <button @click="removeEventById(event.id)"
+                                    class="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity p-1 shrink-0">
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5"><path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"/></svg>
+                            </button>
+                        </li>
+                    </template>
+                    <!-- Extra expense-only items -->
+                    <template x-for="exp in (currentDayData.expenses || [])" :key="'xp-' + exp.id">
+                        <li class="flex items-center gap-2 text-sm border-b border-slate-100 pb-1 group">
+                            <input type="text" x-model="exp.location"
+                                   class="bg-transparent hover:bg-white focus:bg-white border border-transparent hover:border-slate-200 focus:border-blue-300 rounded px-1 py-0.5 flex-grow min-w-0 truncate focus:outline-none transition-all text-slate-600 text-sm">
+                            <input type="text" x-model="exp.cost"
+                                   class="w-24 shrink-0 bg-transparent hover:bg-white focus:bg-white border border-transparent hover:border-slate-200 focus:border-blue-300 rounded px-1 py-0.5 text-right font-mono focus:outline-none transition-all text-slate-700 text-sm"
+                                   placeholder="0 或 NT500">
+                            <button @click="removeExpenseById(exp.id)"
+                                    class="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity p-1 shrink-0">
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5"><path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"/></svg>
+                            </button>
+                        </li>
+                    </template>
+                    <li x-show="currentDayData.events.filter(e => e.cost > 0).length === 0 && (currentDayData.expenses || []).length === 0"
+                        class="text-slate-400 text-sm italic py-2 text-center">尚無支出項目</li>
+                </ul>
+                <div class="mt-4 pt-3 border-t border-slate-200 space-y-1.5">
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-slate-500">本日總計 (JPY)</span>
+                        <span class="font-mono text-base font-bold text-slate-800">¥ <span x-text="currentDayTotal.jpy.toLocaleString()"></span></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-slate-500">折合台幣 <span class="text-xs text-slate-400">(×0.21)</span></span>
+                        <span class="font-mono text-base font-bold text-emerald-700">NT$ <span x-text="currentDayTotal.twd.toLocaleString()"></span></span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Collapsible Timeline -->
+        <div x-show="activeDay !== 'pre-trip'" class="glass-card rounded-2xl overflow-hidden shadow-sm mb-8">
+
+            <!-- Column Headers -->
+            <div class="flex items-center gap-3 px-4 py-2 bg-slate-100/80 border-b border-slate-200 text-xs font-bold text-slate-400 uppercase tracking-wider">
+                <div class="w-5"></div><!-- drag handle -->
+                <div class="w-5"></div><!-- dot -->
+                <div class="w-24 shrink-0">時間</div>
+                <div class="flex-grow">行程</div>
+                <div class="w-24 text-right shrink-0">費用 (¥)</div>
+                <!-- Single toggle button: expand all if any collapsed, collapse all if all expanded -->
+                <button @click="currentDayData.events.some(e => !e.expanded) ? currentDayData.events.forEach(e => e.expanded = true) : currentDayData.events.forEach(e => e.expanded = false)"
+                        :title="currentDayData.events.some(e => !e.expanded) ? '全部展開' : '全部收疊'"
+                        class="p-1 rounded hover:bg-slate-200 transition-colors text-slate-400 hover:text-slate-600 shrink-0">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5">
+                        <path x-show="currentDayData.events.some(e => !e.expanded)" fill-rule="evenodd" d="M10 3a.75.75 0 01.55.24l3.25 3.5a.75.75 0 11-1.1 1.02L10 4.852 7.3 7.76a.75.75 0 01-1.1-1.02l3.25-3.5A.75.75 0 0110 3zm-3.76 9.24a.75.75 0 011.06.04L10 15.148l2.7-2.908a.75.75 0 111.1 1.02l-3.25 3.5a.75.75 0 01-1.1 0l-3.25-3.5a.75.75 0 01.04-1.06z" clip-rule="evenodd"/>
+                        <path x-show="!currentDayData.events.some(e => !e.expanded)" fill-rule="evenodd" d="M14.77 4.21a.75.75 0 01.02 1.06l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 011.08-1.02L10 8.168l3.71-3.938a.75.75 0 011.06-.02zm0 10a.75.75 0 01.02 1.06l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 111.08-1.02L10 18.168l3.71-3.938a.75.75 0 011.06-.02z" clip-rule="evenodd"/>
+                    </svg>
+                </button>
+                <div class="w-5"></div><!-- delete col -->
+            </div>
+
+            <div id="sortable-events">
+            <template x-for="(event, index) in currentDayData.events" :key="event.id">
+                <div class="border-b border-slate-100 last:border-b-0">
+
+                    <!-- Summary Row (always visible) -->
+                    <div class="event-row flex items-center gap-3 px-4 py-3 cursor-pointer select-none group"
+                         @click="toggleEvent(event)">
+
+                        <!-- Drag Handle -->
+                        <div class="drag-handle w-5 shrink-0 text-slate-300 hover:text-slate-500 opacity-0 group-hover:opacity-100 transition-opacity" @click.stop>
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4">
+                                <path d="M7 2a1.5 1.5 0 110 3 1.5 1.5 0 010-3zM13 2a1.5 1.5 0 110 3 1.5 1.5 0 010-3zM7 8.5a1.5 1.5 0 110 3 1.5 1.5 0 010-3zM13 8.5a1.5 1.5 0 110 3 1.5 1.5 0 010-3zM7 15a1.5 1.5 0 110 3 1.5 1.5 0 010-3zM13 15a1.5 1.5 0 110 3 1.5 1.5 0 010-3z"/>
+                            </svg>
+                        </div>
+
+                        <!-- Color Dot -->
+                        <div class="w-2.5 h-2.5 rounded-full shrink-0"
+                             :class="event.cost > 0 ? 'bg-amber-400' : 'bg-blue-400'"></div>
+
+                        <!-- Time -->
+                        <div class="w-24 shrink-0 font-mono text-sm font-semibold text-blue-600 truncate"
+                             x-text="event.time || '—'"></div>
+
+                        <!-- Location -->
+                        <div class="flex-grow font-medium text-slate-700 truncate text-sm"
+                             x-text="event.location"></div>
+
+                        <!-- Cost -->
+                        <div class="w-24 text-right shrink-0 font-mono text-sm"
+                             :class="(String(event.cost||'')).trim() ? 'text-amber-600 font-bold' : 'text-slate-300'"
+                             x-text="(function(){
+                                const s = String(event.cost||'').trim();
+                                if(!s || s==='0') return '—';
+                                if(/^NT\s*/i.test(s)) return 'NT$' + (parseFloat(s.replace(/^NT\s*/i,''))||0).toLocaleString();
+                                return '¥' + (parseFloat(s)||0).toLocaleString();
+                             })()"></div>
+
+                        <!-- Chevron -->
+                        <div :class="event.expanded ? 'rotated' : ''" class="chevron w-5 h-5 text-slate-400 shrink-0">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-5 h-5">
+                                <path fill-rule="evenodd" d="M5.22 8.22a.75.75 0 011.06 0L10 11.94l3.72-3.72a.75.75 0 111.06 1.06l-4.25 4.25a.75.75 0 01-1.06 0L5.22 9.28a.75.75 0 010-1.06z" clip-rule="evenodd" />
+                            </svg>
+                        </div>
+
+                        <!-- Delete -->
+                        <button @click.stop="removeEventById(event.id)"
+                                class="w-5 h-5 text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity shrink-0">
+                            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-4 h-4">
+                                <path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"/>
+                            </svg>
+                        </button>
+                    </div>
+
+                    <!-- Detail Panel (collapsible) -->
+                    <div :class="event.expanded ? 'open' : ''" class="detail-panel">
+                        <div>
+                            <div class="px-5 pb-5 pt-2 bg-slate-50/70 border-t border-slate-100">
+                                
+                                <!-- Editable Fields -->
+                                <div class="flex flex-col md:flex-row md:items-baseline gap-2 mb-3">
+                                    <input type="text" x-model="event.time"
+                                           class="input-clean text-blue-600 font-black tracking-tight w-full md:w-32 text-sm placeholder-blue-300"
+                                           placeholder="時間" @click.stop>
+                                    <input type="text" x-model="event.location"
+                                           class="input-clean text-base font-bold text-slate-800 flex-grow"
+                                           placeholder="地點/活動名稱" @click.stop>
+                                </div>
+
+                                <textarea x-model="event.detail" rows="2" @click.stop
+                                          class="input-clean w-full text-slate-600 text-sm leading-relaxed mb-3 resize-none"
+                                          placeholder="行程細節..."></textarea>
+
+                                <!-- Address & Hours -->
+                                <div x-show="event.address || event.hours" class="flex flex-wrap gap-y-1 gap-x-4 mb-3">
+                                    <template x-if="event.address">
+                                        <div class="flex items-center gap-1 text-xs text-slate-500">
+                                            <span>📍</span><span x-text="event.address"></span>
+                                        </div>
+                                    </template>
+                                    <template x-if="event.hours">
+                                        <div class="flex items-center gap-1 text-xs text-slate-500">
+                                            <span>🕒</span><span x-text="event.hours"></span>
+                                        </div>
+                                    </template>
+                                </div>
+
+                                <!-- Links -->
+                                <div class="flex flex-wrap gap-2 mb-3">
+                                    <template x-if="event.mapUrl">
+                                        <a :href="event.mapUrl" target="_blank" rel="noopener noreferrer" @click.stop
+                                           class="inline-flex items-center gap-1 px-3 py-1.5 bg-blue-100 text-blue-700 text-xs font-bold rounded-lg hover:bg-blue-200 transition-colors">
+                                            🗺️ Google Maps
+                                        </a>
+                                    </template>
+                                    <template x-if="event.links && event.links.length > 0">
+                                        <template x-for="link in event.links">
+                                            <a :href="link.url" target="_blank" rel="noopener noreferrer" @click.stop
+                                               class="inline-flex items-center gap-1 px-3 py-1.5 bg-slate-800 text-white text-xs font-semibold rounded-lg hover:bg-blue-600 transition-colors">
+                                                🔗 <span x-text="link.title"></span>
+                                            </a>
+                                        </template>
+                                    </template>
+                                </div>
+
+                                <!-- Note & Cost -->
+                                <div class="flex flex-col sm:flex-row sm:items-center gap-3 pt-3 border-t border-slate-200">
+                                    <div class="flex items-center gap-2 flex-grow">
+                                        <span class="text-xs text-slate-400 whitespace-nowrap">📝 備註</span>
+                                        <input type="text" x-model="event.note" @click.stop
+                                               class="input-clean w-full text-xs text-slate-500 border-b border-transparent focus:border-blue-200"
+                                               placeholder="點擊新增備註...">
+                                    </div>
+                                    <div class="flex items-center gap-2 shrink-0">
+                                        <label class="text-xs font-bold text-slate-400">💰 費用</label>
+                                        <input type="text" x-model="event.cost" @click.stop
+                                               class="w-28 bg-white border border-slate-200 rounded-md py-1 px-2 text-right text-sm font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all placeholder:text-slate-300"
+                                               placeholder="0 或 NT500">
+                                    </div>
+                                </div>
+
+                            </div>
+                        </div>
+                    </div>
+
+                </div>
+            </template>
+            </div><!-- end sortable-events -->
+
+            <!-- Add Event Button -->
+            <div class="p-3">
+                <button @click="addEvent()"
+                        class="w-full py-2.5 border-2 border-dashed border-slate-200 rounded-xl text-slate-400 font-bold hover:border-blue-400 hover:text-blue-500 hover:bg-blue-50/50 transition-all flex items-center justify-center gap-2 text-sm">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" class="w-5 h-5">
+                        <path fill-rule="evenodd" d="M12 3.75a.75.75 0 01.75.75v6.75h6.75a.75.75 0 010 1.5h-6.75v6.75a.75.75 0 01-1.5 0v-6.75H4.5a.75.75 0 010-1.5h6.75V4.5a.75.75 0 01.75-.75z" clip-rule="evenodd" />
+                    </svg>
+                    新增行程
+                </button>
+            </div>
+        </div>
+
+    </main>
+</body>
+</html>
