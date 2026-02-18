@@ -43,13 +43,17 @@
                 activeDay: 'day2',
                 sortableInstance: null,
                 newChecklistItem: '',
-                newChecklistType: 'item',  // 'item' | 'category'
+                newChecklistType: 'item',
                 syncStatus: 'loading',
                 _saveTimer: null,
                 _watcherPaused: false,
+                _ignoreNextSnapshot: false,
                 _dataVersion: 2,  // ← 每次更新 HTML 內容時遞增此數字
+                jpyRate: null,
+                jpyRateDate: '',
 
                 init() {
+                    this._fetchJpyRate();
                     // Wait for Firebase then load
                     const setup = () => {
                         this._listenFirebase();
@@ -77,29 +81,42 @@
                 _listenFirebase() {
                     window._firebaseOnValue(window._firebaseRef, (snapshot) => {
                         const cloudData = snapshot.val();
-                        this._watcherPaused = true;
+
+                        // If we just saved, Firebase echoes back — ignore it
+                        if (this._ignoreNextSnapshot) {
+                            this._ignoreNextSnapshot = false;
+                            return;
+                        }
 
                         if (cloudData && Array.isArray(cloudData)) {
                             const cloudVersion = cloudData._version || 0;
                             const localVersion = this._dataVersion || 1;
 
                             if (cloudVersion >= localVersion) {
-                                // Cloud is same or newer — use cloud data
+                                // Cloud is same or newer — apply cloud data
+                                this._watcherPaused = true;
                                 this.itinerary = cloudData;
+                                this._normalizeItinerary();
+                                this.$nextTick(() => {
+                                    this.initSortable();
+                                    this._watcherPaused = false;
+                                });
                             } else {
-                                // Local HTML is newer (just updated) — push local to cloud
+                                // Local HTML is newer — push local to cloud once
+                                this._normalizeItinerary();
                                 const clean = JSON.parse(JSON.stringify(this.itinerary));
                                 clean._version = localVersion;
+                                this._ignoreNextSnapshot = true;
                                 window._firebaseSet(window._firebaseRef, clean);
                             }
                         } else {
-                            // No cloud data yet — push local data up
+                            // No cloud data yet — push local up
+                            this._normalizeItinerary();
                             const clean = JSON.parse(JSON.stringify(this.itinerary));
                             clean._version = this._dataVersion || 1;
+                            this._ignoreNextSnapshot = true;
                             window._firebaseSet(window._firebaseRef, clean);
                         }
-
-                        this._normalizeItinerary();
 
                         if (this.syncStatus === 'loading') {
                             this.$nextTick(() => {
@@ -108,7 +125,7 @@
                             });
                         }
                         this.syncStatus = 'synced';
-                        this._watcherPaused = false;
+
                     }, (error) => {
                         console.error('Firebase error:', error);
                         this.syncStatus = 'offline';
@@ -152,11 +169,65 @@
 
                 _saveToFirebase() {
                     if (this.syncStatus === 'offline') return;
-                    // Strip non-serializable data before saving
                     const clean = JSON.parse(JSON.stringify(this.itinerary));
+                    clean._version = this._dataVersion || 1;
+                    this._ignoreNextSnapshot = true;
                     window._firebaseSet(window._firebaseRef, clean)
                         .then(() => { this.syncStatus = 'synced'; })
-                        .catch(() => { this.syncStatus = 'offline'; });
+                        .catch(() => {
+                            this._ignoreNextSnapshot = false;
+                            this.syncStatus = 'offline';
+                        });
+                },
+
+                async _fetchJpyRate() {
+                    try {
+                        // 台灣銀行牌告匯率 CSV (CORS-friendly endpoint)
+                        const res = await fetch('https://rate.bot.com.tw/xchg/flcsv/0/day');
+                        const text = await res.text();
+                        // CSV format: 幣別,現金買入,現金賣出,即期買入,即期賣出,...
+                        const lines = text.split('\n');
+                        for (const line of lines) {
+                            if (line.startsWith('日本')) {
+                                const cols = line.split(',');
+                                // cols[3] = 即期買入, cols[4] = 即期賣出
+                                const sell = parseFloat(cols[4]);
+                                if (!isNaN(sell)) {
+                                    this.jpyRate = sell;
+                                    this.jpyRateDate = new Date().toLocaleDateString('zh-TW');
+                                }
+                                break;
+                            }
+                        }
+                    } catch (e) {
+                        // CORS blocked — fallback: try via allorigins proxy
+                        try {
+                            const proxy = 'https://api.allorigins.win/raw?url=' + encodeURIComponent('https://rate.bot.com.tw/xchg/flcsv/0/day');
+                            const res2 = await fetch(proxy);
+                            const text2 = await res2.text();
+                            const lines2 = text2.split('\n');
+                            for (const line of lines2) {
+                                if (line.startsWith('日本')) {
+                                    const cols = line.split(',');
+                                    const sell = parseFloat(cols[4]);
+                                    if (!isNaN(sell)) {
+                                        this.jpyRate = sell;
+                                        this.jpyRateDate = new Date().toLocaleDateString('zh-TW');
+                                    }
+                                    break;
+                                }
+                            }
+                        } catch (e2) {
+                            console.warn('匯率取得失敗，使用預設值');
+                            this.jpyRate = 0.2195; // 備用匯率
+                            this.jpyRateDate = '預設值';
+                        }
+                    }
+                },
+
+                toTwd(jpy) {
+                    if (!this.jpyRate || !jpy) return null;
+                    return Math.round(jpy * this.jpyRate);
                 },
 
                 get syncLabel() {
@@ -196,17 +267,36 @@
                 get currentDayData() {
                     return this.itinerary.find(d => d.id === this.activeDay);
                 },
-                get currentDayTotal() {
-                    const ec = this.currentDayData.events.reduce((s, i) => s + (parseInt(i.cost) || 0), 0);
-                    const xc = (this.currentDayData.expenses || []).reduce((s, i) => s + (parseInt(i.cost) || 0), 0);
-                    return ec + xc;
+
+                // 解析費用：NT開頭視為台幣，其他視為JPY轉台幣
+                parseCost(val) {
+                    const s = String(val || '').trim();
+                    if (/^NT\s*/i.test(s)) {
+                        return { jpy: 0, twd: parseFloat(s.replace(/^NT\s*/i, '')) || 0 };
+                    }
+                    const jpy = parseFloat(s) || 0;
+                    return { jpy, twd: Math.round(jpy * 0.21) };
                 },
+
+                _sumItems(items) {
+                    return (items || []).reduce((acc, i) => {
+                        const p = this.parseCost(i.cost);
+                        return { jpy: acc.jpy + p.jpy, twd: acc.twd + p.twd };
+                    }, { jpy: 0, twd: 0 });
+                },
+
+                get currentDayTotal() {
+                    const ev = this._sumItems(this.currentDayData.events);
+                    const ex = this._sumItems(this.currentDayData.expenses);
+                    return { jpy: ev.jpy + ex.jpy, twd: ev.twd + ex.twd };
+                },
+
                 get totalBudget() {
-                    return this.itinerary.reduce((total, day) => {
-                        const ec = day.events.reduce((s, i) => s + (parseInt(i.cost) || 0), 0);
-                        const xc = (day.expenses || []).reduce((s, i) => s + (parseInt(i.cost) || 0), 0);
-                        return total + ec + xc;
-                    }, 0);
+                    return this.itinerary.reduce((acc, day) => {
+                        const ev = this._sumItems(day.events);
+                        const ex = this._sumItems(day.expenses);
+                        return { jpy: acc.jpy + ev.jpy + ex.jpy, twd: acc.twd + ev.twd + ex.twd };
+                    }, { jpy: 0, twd: 0 });
                 },
 
                 toggleEvent(event) {
@@ -529,7 +619,12 @@
         <div class="relative z-10 text-center px-4">
             <h1 class="text-4xl md:text-5xl font-extrabold text-white tracking-widest drop-shadow-md mb-2">TOHOKU WINTER</h1>
             <p class="text-lg md:text-xl text-slate-100 font-medium tracking-wide drop-shadow">仙台・山形・藏王 滑雪紀行</p>
-            <p class="text-sm text-slate-200 mt-2 font-mono">2026.02.19 - 03.01 | 總預算預估: <span x-text="totalBudget.toLocaleString()"></span> JPY</p>
+            <p class="text-sm text-slate-200 mt-2 font-mono">
+                2026.02.19 - 03.01 |
+                ¥<span x-text="totalBudget.jpy.toLocaleString()"></span>
+                <span class="text-slate-300 mx-1">≈</span>
+                NT$<span x-text="totalBudget.twd.toLocaleString()"></span>
+            </p>
             <p class="mt-2 text-xs font-semibold tracking-wide" :class="syncColor" x-text="syncLabel"></p>
         </div>
     </header>
@@ -685,12 +780,13 @@
                 </div>
                 <ul class="space-y-0.5 flex-grow overflow-y-auto max-h-64 pr-1">
                     <!-- Events with cost (now editable + deletable, same layout) -->
-                    <template x-for="event in currentDayData.events.filter(e => e.cost > 0)" :key="'ev-' + event.id">
+                    <template x-for="event in currentDayData.events.filter(e => String(e.cost||'').trim() && String(e.cost||'').trim() !== '0')" :key="'ev-' + event.id">
                         <li class="flex items-center gap-2 text-sm border-b border-slate-100 pb-1 group">
                             <input type="text" x-model="event.location"
                                    class="bg-transparent hover:bg-white focus:bg-white border border-transparent hover:border-slate-200 focus:border-blue-300 rounded px-1 py-0.5 flex-grow min-w-0 truncate focus:outline-none transition-all text-slate-600 text-sm">
-                            <input type="number" x-model="event.cost"
-                                   class="w-20 shrink-0 bg-transparent hover:bg-white focus:bg-white border border-transparent hover:border-slate-200 focus:border-blue-300 rounded px-1 py-0.5 text-right font-mono focus:outline-none transition-all text-slate-700 text-sm">
+                            <input type="text" x-model="event.cost"
+                                   class="w-24 shrink-0 bg-transparent hover:bg-white focus:bg-white border border-transparent hover:border-slate-200 focus:border-blue-300 rounded px-1 py-0.5 text-right font-mono focus:outline-none transition-all text-slate-700 text-sm"
+                                   placeholder="0">
                             <button @click="removeEventById(event.id)"
                                     class="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity p-1 shrink-0">
                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5"><path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"/></svg>
@@ -702,8 +798,9 @@
                         <li class="flex items-center gap-2 text-sm border-b border-slate-100 pb-1 group">
                             <input type="text" x-model="exp.location"
                                    class="bg-transparent hover:bg-white focus:bg-white border border-transparent hover:border-slate-200 focus:border-blue-300 rounded px-1 py-0.5 flex-grow min-w-0 truncate focus:outline-none transition-all text-slate-600 text-sm">
-                            <input type="number" x-model="exp.cost"
-                                   class="w-20 shrink-0 bg-transparent hover:bg-white focus:bg-white border border-transparent hover:border-slate-200 focus:border-blue-300 rounded px-1 py-0.5 text-right font-mono focus:outline-none transition-all text-slate-700 text-sm">
+                            <input type="text" x-model="exp.cost"
+                                   class="w-24 shrink-0 bg-transparent hover:bg-white focus:bg-white border border-transparent hover:border-slate-200 focus:border-blue-300 rounded px-1 py-0.5 text-right font-mono focus:outline-none transition-all text-slate-700 text-sm"
+                                   placeholder="0 或 NT500">
                             <button @click="removeExpenseById(exp.id)"
                                     class="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity p-1 shrink-0">
                                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5"><path d="M6.28 5.22a.75.75 0 00-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 101.06 1.06L10 11.06l3.72 3.72a.75.75 0 101.06-1.06L11.06 10l3.72-3.72a.75.75 0 00-1.06-1.06L10 8.94 6.28 5.22z"/></svg>
@@ -713,9 +810,15 @@
                     <li x-show="currentDayData.events.filter(e => e.cost > 0).length === 0 && (currentDayData.expenses || []).length === 0"
                         class="text-slate-400 text-sm italic py-2 text-center">尚無支出項目</li>
                 </ul>
-                <div class="mt-4 pt-3 border-t border-slate-200 flex justify-between items-center font-bold text-slate-800">
-                    <span>本日總計</span>
-                    <span class="font-mono text-lg" x-text="currentDayTotal.toLocaleString()"></span>
+                <div class="mt-4 pt-3 border-t border-slate-200 space-y-1.5">
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-slate-500">本日總計 (JPY)</span>
+                        <span class="font-mono text-base font-bold text-slate-800">¥ <span x-text="currentDayTotal.jpy.toLocaleString()"></span></span>
+                    </div>
+                    <div class="flex justify-between items-center">
+                        <span class="text-sm text-slate-500">折合台幣 <span class="text-xs text-slate-400">(×0.21)</span></span>
+                        <span class="font-mono text-base font-bold text-emerald-700">NT$ <span x-text="currentDayTotal.twd.toLocaleString()"></span></span>
+                    </div>
                 </div>
             </div>
         </div>
@@ -730,23 +833,15 @@
                 <div class="w-24 shrink-0">時間</div>
                 <div class="flex-grow">行程</div>
                 <div class="w-24 text-right shrink-0">費用 (¥)</div>
-                <!-- Expand / Collapse all -->
-                <div class="flex items-center gap-1 shrink-0">
-                    <button @click="currentDayData.events.forEach(e => e.expanded = true)"
-                            title="全部展開"
-                            class="p-1 rounded hover:bg-slate-200 transition-colors text-slate-400 hover:text-slate-600">
-                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5">
-                            <path fill-rule="evenodd" d="M10 3a.75.75 0 01.55.24l3.25 3.5a.75.75 0 11-1.1 1.02L10 4.852 7.3 7.76a.75.75 0 01-1.1-1.02l3.25-3.5A.75.75 0 0110 3zm-3.76 9.24a.75.75 0 011.06.04L10 15.148l2.7-2.908a.75.75 0 111.1 1.02l-3.25 3.5a.75.75 0 01-1.1 0l-3.25-3.5a.75.75 0 01.04-1.06z" clip-rule="evenodd"/>
-                        </svg>
-                    </button>
-                    <button @click="currentDayData.events.forEach(e => e.expanded = false)"
-                            title="全部收疊"
-                            class="p-1 rounded hover:bg-slate-200 transition-colors text-slate-400 hover:text-slate-600">
-                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5">
-                            <path fill-rule="evenodd" d="M14.77 4.21a.75.75 0 01.02 1.06l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 011.08-1.02L10 8.168l3.71-3.938a.75.75 0 011.06-.02zm0 10a.75.75 0 01.02 1.06l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 111.08-1.02L10 18.168l3.71-3.938a.75.75 0 011.06-.02z" clip-rule="evenodd"/>
-                        </svg>
-                    </button>
-                </div>
+                <!-- Single toggle button: expand all if any collapsed, collapse all if all expanded -->
+                <button @click="currentDayData.events.some(e => !e.expanded) ? currentDayData.events.forEach(e => e.expanded = true) : currentDayData.events.forEach(e => e.expanded = false)"
+                        :title="currentDayData.events.some(e => !e.expanded) ? '全部展開' : '全部收疊'"
+                        class="p-1 rounded hover:bg-slate-200 transition-colors text-slate-400 hover:text-slate-600 shrink-0">
+                    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" class="w-3.5 h-3.5">
+                        <path x-show="currentDayData.events.some(e => !e.expanded)" fill-rule="evenodd" d="M10 3a.75.75 0 01.55.24l3.25 3.5a.75.75 0 11-1.1 1.02L10 4.852 7.3 7.76a.75.75 0 01-1.1-1.02l3.25-3.5A.75.75 0 0110 3zm-3.76 9.24a.75.75 0 011.06.04L10 15.148l2.7-2.908a.75.75 0 111.1 1.02l-3.25 3.5a.75.75 0 01-1.1 0l-3.25-3.5a.75.75 0 01.04-1.06z" clip-rule="evenodd"/>
+                        <path x-show="!currentDayData.events.some(e => !e.expanded)" fill-rule="evenodd" d="M14.77 4.21a.75.75 0 01.02 1.06l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 011.08-1.02L10 8.168l3.71-3.938a.75.75 0 011.06-.02zm0 10a.75.75 0 01.02 1.06l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 111.08-1.02L10 18.168l3.71-3.938a.75.75 0 011.06-.02z" clip-rule="evenodd"/>
+                    </svg>
+                </button>
                 <div class="w-5"></div><!-- delete col -->
             </div>
 
@@ -779,8 +874,13 @@
 
                         <!-- Cost -->
                         <div class="w-24 text-right shrink-0 font-mono text-sm"
-                             :class="event.cost > 0 ? 'text-amber-600 font-bold' : 'text-slate-300'"
-                             x-text="event.cost > 0 ? '¥' + parseInt(event.cost).toLocaleString() : '—'"></div>
+                             :class="(String(event.cost||'')).trim() ? 'text-amber-600 font-bold' : 'text-slate-300'"
+                             x-text="(function(){
+                                const s = String(event.cost||'').trim();
+                                if(!s || s==='0') return '—';
+                                if(/^NT\s*/i.test(s)) return 'NT$' + (parseFloat(s.replace(/^NT\s*/i,''))||0).toLocaleString();
+                                return '¥' + (parseFloat(s)||0).toLocaleString();
+                             })()"></div>
 
                         <!-- Chevron -->
                         <div :class="event.expanded ? 'rotated' : ''" class="chevron w-5 h-5 text-slate-400 shrink-0">
@@ -858,13 +958,10 @@
                                                placeholder="點擊新增備註...">
                                     </div>
                                     <div class="flex items-center gap-2 shrink-0">
-                                        <label class="text-xs font-bold text-slate-400">💰 預算</label>
-                                        <div class="relative">
-                                            <span class="absolute left-2 top-1/2 -translate-y-1/2 text-slate-400 text-xs">¥</span>
-                                            <input type="number" x-model="event.cost" @click.stop
-                                                   class="w-28 bg-white border border-slate-200 rounded-md py-1 pl-5 pr-2 text-right text-sm font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all placeholder:text-slate-300"
-                                                   placeholder="0">
-                                        </div>
+                                        <label class="text-xs font-bold text-slate-400">💰 費用</label>
+                                        <input type="text" x-model="event.cost" @click.stop
+                                               class="w-28 bg-white border border-slate-200 rounded-md py-1 px-2 text-right text-sm font-mono text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all placeholder:text-slate-300"
+                                               placeholder="0 或 NT500">
                                     </div>
                                 </div>
 
